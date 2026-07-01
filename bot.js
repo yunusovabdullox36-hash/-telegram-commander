@@ -541,18 +541,15 @@ async function start() {
   log('✅ HTTP server running — Render health check ready');
 }
 
-// Helper: timeout wrapper for any promise
+// Helper: timeout wrapper for any promise (Promise.race approach)
 function withTimeout(promise, ms, label) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
-  return promise.then(result => {
-    clearTimeout(timer);
-    return result;
-  }).catch(err => {
-    clearTimeout(timer);
-    if (err.name === 'AbortError') throw new Error(`${label} timed out after ${ms}ms`);
-    throw err;
-  });
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    })
+  ]).finally(() => clearTimeout(timer));
 }
 
 // Async Telegram connection (does NOT crash process on failure)
