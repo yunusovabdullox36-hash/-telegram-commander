@@ -388,6 +388,22 @@ function startCloudAPI(bot, useWebhook) {
       return;
     }
 
+    // Debug — test Telegram API connectivity
+    if (pathname === '/api/debug') {
+      (async () => {
+        try {
+          const resp = await withTimeout(fetch('https://api.telegram.org/bot' + CONFIG.token + '/getMe'), 10000, 'test-telegram');
+          const data = await resp.json();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ telegram: 'reachable', ok: data.ok, username: data.result?.username }));
+        } catch (e) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ telegram: 'unreachable', error: e.message }));
+        }
+      })();
+      return;
+    }
+
     // Stats
     if (pathname === '/api/stats') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
