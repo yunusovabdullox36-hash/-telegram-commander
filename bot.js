@@ -531,9 +531,10 @@ async function start() {
       log('   Bot will not send/receive messages until Telegram reconnects');
       // Keep retrying every 30 seconds
       const retryTimer = setInterval(async () => {
-        const ok = await connectTelegramAsync(bot);
-        if (ok) {
-          clearInterval(retryTimer);
+        try {
+          const ok = await connectTelegramAsync(bot);
+          if (ok) {
+            clearInterval(retryTimer);
           log('✅ Telegram reconnected');
           
           // Start outbox processing
@@ -549,6 +550,9 @@ async function start() {
           
           log('✅ Relay active');
         }
+      } catch (e) {
+        log(`Retry error: ${e.message}`);
+      }
       }, 30000);
       pollingIntervals.push(retryTimer);
     }
@@ -584,23 +588,23 @@ async function connectTelegramAsync(bot) {
     bot.botInfo = { id: me.id, username: me.username };
     
     if (IS_CLOUD && CONFIG.webhookDomain) {
-      // Try to set webhook (best effort — if it fails, polling still works)
+      // Try to set webhook (best effort)
       try {
         const webhookUrl = `https://${CONFIG.webhookDomain}/telegraf`;
         await tgApi(`setWebhook?url=${encodeURIComponent(webhookUrl)}`, 10000);
         log(`✅ Webhook set: ${webhookUrl}`);
+        bot.webhookCallback = null; // We handle updates via raw HTTP route
       } catch (e) {
-        log(`⚠️ Webhook failed: ${e.message} (falling back to polling)`);
+        log(`⚠️ Webhook failed: ${e.message}`);
       }
-      
+    }
+    
+    // Start polling with Telegraf (try/catch — if it hangs, we still have the API)
+    try {
       bot.startPolling();
       log(`✅ Bot @${me.username} is live (polling on :${CONFIG.serverPort})`);
-    } else if (IS_CLOUD) {
-      bot.startPolling();
-      log(`✅ Bot @${me.username} is live (polling on :${CONFIG.serverPort})`);
-    } else {
-      bot.startPolling();
-      log(`✅ Bot @${me.username} is live (local polling)`);
+    } catch (e) {
+      log(`⚠️ Polling start failed: ${e.message} — webhook mode only`);
     }
     return true;
   } catch (e) {
