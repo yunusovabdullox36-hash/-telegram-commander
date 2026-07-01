@@ -34,7 +34,31 @@ const CONFIG = {
 };
 
 // Track which messages we've already processed
+const KNOWN_IDS_FILE = path.join(__dirname, 'data', 'known-msg-ids.json');
 let knownMsgIds = new Set();
+
+// Load known IDs from disk (survive restarts)
+try {
+  if (fs.existsSync(KNOWN_IDS_FILE)) {
+    const arr = JSON.parse(fs.readFileSync(KNOWN_IDS_FILE, 'utf-8'));
+    if (Array.isArray(arr)) knownMsgIds = new Set(arr);
+    console.log(`[sync] Loaded ${knownMsgIds.size} known message IDs`);
+  }
+} catch (e) {
+  console.log(`[sync] Could not load known IDs: ${e.message}`);
+}
+
+function saveKnownIds() {
+  try {
+    const dir = path.dirname(KNOWN_IDS_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    // Keep only last 1000 IDs to prevent file bloat
+    const arr = Array.from(knownMsgIds).slice(-1000);
+    fs.writeFileSync(KNOWN_IDS_FILE, JSON.stringify(arr), 'utf-8');
+  } catch (e) {
+    console.log(`[sync] Could not save known IDs: ${e.message}`);
+  }
+}
 
 // ================================================================
 // Obsidian Vault FS
@@ -148,6 +172,7 @@ async function pullMessages() {
       vaultAppend(`_Miya/Daily/${today}.md`, `\n## Telegram — ${ts}\n> ${msg.text}\n`);
       
       console.log(`[sync] <- Inbox: ${msg.text.substring(0, 60)}`);
+      saveKnownIds();
     }
 
     // Acknowledge processed messages
@@ -192,17 +217,16 @@ async function pushResponses() {
   }
 }
 
+let CLOUD_AVAILABLE = false;
+
 // ================================================================
 // Sync Loop
 // ================================================================
 async function syncLoop() {
-  if (CLOUD_AVAILABLE) {
-    await pullMessages();
-    await pushResponses();
-  }
+  if (!CLOUD_AVAILABLE) return;
+  await pullMessages();
+  await pushResponses();
 }
-
-let CLOUD_AVAILABLE = false;
 
 async function checkCloud() {
   try {
@@ -246,7 +270,13 @@ async function start() {
     }
   }, CONFIG.pollInterval * 1000);
 
+  // Periodic known IDs cleanup (every 10 min)
+  setInterval(() => saveKnownIds(), 600000);
+
   console.log('[sync] ✅ Sync active');
+  console.log(`[sync]    Poll every ${CONFIG.pollInterval}s`);
+  console.log(`[sync]    Cloud API: ${CONFIG.cloudApi}`);
+  console.log(`[sync]    Vault: ${CONFIG.vaultPath}`);
 }
 
 start();
