@@ -568,17 +568,26 @@ function withTimeout(promise, ms, label) {
   ]).finally(() => clearTimeout(timer));
 }
 
-// Async Telegram connection (does NOT crash process on failure)
+// Fetch-based Telegram API call (bypasses Telegraf's http issues on Render)
+async function tgApi(method, timeoutMs = 15000) {
+  const url = `https://api.telegram.org/bot${CONFIG.token}/${method}`;
+  const resp = await withTimeout(fetch(url), timeoutMs, `tg.${method}`);
+  const data = await resp.json();
+  if (!data.ok) throw new Error(`Telegram API ${method}: ${data.description}`);
+  return data.result;
+}
+
+// Async Telegram connection (fetch-based, NOT Telegraf's http client)
 async function connectTelegramAsync(bot) {
   try {
-    const me = await withTimeout(bot.telegram.getMe(), 15000, 'getMe');
-    bot.botInfo = me;
+    const me = await tgApi('getMe', 15000);
+    bot.botInfo = { id: me.id, username: me.username };
     
     if (IS_CLOUD && CONFIG.webhookDomain) {
       // Try to set webhook (best effort — if it fails, polling still works)
       try {
         const webhookUrl = `https://${CONFIG.webhookDomain}/telegraf`;
-        await withTimeout(bot.telegram.setWebhook(webhookUrl), 10000, 'setWebhook');
+        await tgApi(`setWebhook?url=${encodeURIComponent(webhookUrl)}`, 10000);
         log(`✅ Webhook set: ${webhookUrl}`);
       } catch (e) {
         log(`⚠️ Webhook failed: ${e.message} (falling back to polling)`);
