@@ -249,23 +249,14 @@ async function processOutbox(bot) {
       await rateLimiter.acquire();
       try {
         if (item.type === 'text') {
-          await bot.telegram.sendMessage(CONFIG.ownerId, item.text, {
-            reply_to_message_id: item.replyTo
-          });
+          await tgSend(CONFIG.ownerId, item.text, { reply_to_message_id: item.replyTo });
         } else if (item.type === 'screenshot') {
-          if (isScreenshotAvailable() && IS_LOCAL) {
-            await handleScreenshot(bot);
-          } else {
-            await bot.telegram.sendMessage(CONFIG.ownerId, '❌ Screenshot not available in cloud mode');
-          }
+          await tgSend(CONFIG.ownerId, '❌ Screenshot not available in cloud mode');
         }
       } catch (e) {
         log(`Cloud send error: ${e.message}`);
-        if (e.response && e.response.statusCode === 429) {
-          const retryAfter = e.response.parameters?.retry_after || 5;
-          log(`Rate limited, waiting ${retryAfter}s...`);
-          await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-          // Re-queue failed items
+        if (e.message.includes('429') || e.message.includes('retry')) {
+          await new Promise(resolve => setTimeout(resolve, 5000));
           outboxQueue.unshift(item);
           cloudSaveOutbox();
         }
@@ -578,34 +569,109 @@ async function tgApi(method, timeoutMs = 15000) {
   const resp = await withTimeout(fetch(url), timeoutMs, `tg.${method}`);
   const data = await resp.json();
   if (!data.ok) throw new Error(`Telegram API ${method}: ${data.description}`);
-  return data.result;
+  return data;
+}
+
+// Last seen update ID for polling
+let lastUpdateId = 0;
+
+// Fetch-based Telegram send (avoids Telegraf's http client in cloud mode)
+async function tgSend(chatId, text, opts = {}) {
+  const params = new URLSearchParams({ chat_id: chatId, text });
+  if (opts.reply_to_message_id) params.set('reply_to_message_id', opts.reply_to_message_id);
+  if (opts.parse_mode) params.set('parse_mode', opts.parse_mode);
+  await tgApi(`sendMessage?${params.toString()}`, 10000);
+}
+
+async function tgSendPhoto(chatId, caption) {
+  let timer;
+  try {
+    const url = `https://api.telegram.org/bot${CONFIG.token}/sendPhoto`;
+    const formBody = `chat_id=${chatId}&caption=${encodeURIComponent(caption)}`;
+    // For simplicity, just send a text message since photo requires multipart
+    throw new Error('Photo: ' + caption);
+  } catch (e) {
+    // Fallback to text
+    await tgSend(chatId, `📸 ${caption}`);
+  }
+}
+
+// Simple fetch-based polling loop (no Telegraf dependency)
+async function startFetchPolling(bot) {
+  log('📡 Starting fetch-based polling...');
+  let pollCount = 0;
+  
+  while (true) {
+    try {
+      const timeout = 30000; // 30s long poll
+      const params = `getUpdates?timeout=${timeout}&offset=${lastUpdateId + 1}&limit=10&allowed_updates=["message"]`;
+      const result = await tgApi(params, timeout + 5000);
+      
+      if (result.ok && Array.isArray(result.result)) {
+        for (const update of result.result) {
+          if (update.update_id > lastUpdateId) lastUpdateId = update.update_id;
+          
+          if (update.message && update.message.text) {
+            const ctx = {
+              message: update.message,
+              reply: async (text, extra) => {
+                const payload = `sendMessage?chat_id=${update.message.chat.id}&text=${encodeURIComponent(text)}&reply_to_message_id=${update.message.message_id}`;
+                return tgApi(payload, 5000).catch(e => log(`Reply error: ${e.message}`));
+              }
+            };
+            // Process message
+            const text = update.message.text;
+            log(`<- (poll) ${text.substring(0, 80)}`);
+            
+            // Handle commands
+            if (text.startsWith('/')) {
+              const cmd = text.split(' ')[0].toLowerCase();
+              switch (cmd) {
+                case '/start': await ctx.reply('✅ Telegram Commander Cloud — 24/7 active'); break;
+                case '/status': await ctx.reply(`🤖 Bot status:\n• Mode: cloud\n• Pending messages: ${messageQueue.length}\n• Uptime: ${Math.floor(process.uptime() / 60)} min`); break;
+                case '/help': await ctx.reply(`📋 Commands:\n/status — Bot status\n/help — This help`); break;
+                case '/queue': await ctx.reply(`📬 Pending: ${messageQueue.length} messages, ${outboxQueue.length} outgoing`); break;
+                default: await ctx.reply(`Unknown command: ${cmd}`); break;
+              }
+            }
+            
+            // Save message
+            saveIncomingMessage(text, update.message.message_id, new Date().toISOString());
+          }
+        }
+      }
+      
+      pollCount++;
+      if (pollCount % 10 === 0) log(`Polling: ${pollCount} cycles, lastUpdateId: ${lastUpdateId}`);
+    } catch (e) {
+      log(`Poll error: ${e.message} — retrying in 10s`);
+      await new Promise(r => setTimeout(r, 10000));
+    }
+  }
 }
 
 // Async Telegram connection (fetch-based, NOT Telegraf's http client)
 async function connectTelegramAsync(bot) {
   try {
-    const me = await tgApi('getMe', 15000);
+    const result = await tgApi('getMe', 15000);
+    const me = result.result;
     bot.botInfo = { id: me.id, username: me.username };
     
+    log(`✅ Telegram connected as @${me.username}`);
+    
     if (IS_CLOUD && CONFIG.webhookDomain) {
-      // Try to set webhook (best effort)
       try {
         const webhookUrl = `https://${CONFIG.webhookDomain}/telegraf`;
         await tgApi(`setWebhook?url=${encodeURIComponent(webhookUrl)}`, 10000);
         log(`✅ Webhook set: ${webhookUrl}`);
-        bot.webhookCallback = null; // We handle updates via raw HTTP route
       } catch (e) {
         log(`⚠️ Webhook failed: ${e.message}`);
       }
     }
     
-    // Start polling with Telegraf (try/catch — if it hangs, we still have the API)
-    try {
-      bot.startPolling();
-      log(`✅ Bot @${me.username} is live (polling on :${CONFIG.serverPort})`);
-    } catch (e) {
-      log(`⚠️ Polling start failed: ${e.message} — webhook mode only`);
-    }
+    // Start fetch-based polling (runs forever, doesn't block HTTP server)
+    startFetchPolling(bot).catch(e => log(`Poll loop crashed: ${e.message}`));
+    
     return true;
   } catch (e) {
     log(`⚠️ Telegram connection failed: ${e.message}`);
