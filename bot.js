@@ -541,17 +541,31 @@ async function start() {
   log('✅ HTTP server running — Render health check ready');
 }
 
+// Helper: timeout wrapper for any promise
+function withTimeout(promise, ms, label) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return promise.then(result => {
+    clearTimeout(timer);
+    return result;
+  }).catch(err => {
+    clearTimeout(timer);
+    if (err.name === 'AbortError') throw new Error(`${label} timed out after ${ms}ms`);
+    throw err;
+  });
+}
+
 // Async Telegram connection (does NOT crash process on failure)
 async function connectTelegramAsync(bot) {
   try {
-    const me = await bot.telegram.getMe();
+    const me = await withTimeout(bot.telegram.getMe(), 15000, 'getMe');
     bot.botInfo = me;
     
     if (IS_CLOUD && CONFIG.webhookDomain) {
       // Try to set webhook (best effort — if it fails, polling still works)
       try {
         const webhookUrl = `https://${CONFIG.webhookDomain}/telegraf`;
-        await bot.telegram.setWebhook(webhookUrl);
+        await withTimeout(bot.telegram.setWebhook(webhookUrl), 10000, 'setWebhook');
         log(`✅ Webhook set: ${webhookUrl}`);
       } catch (e) {
         log(`⚠️ Webhook failed: ${e.message} (falling back to polling)`);
