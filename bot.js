@@ -323,13 +323,14 @@ function startCloudAPI(bot, useWebhook) {
     const url = new URL(req.url, `http://localhost:${CONFIG.serverPort}`);
     const pathname = url.pathname;
 
-    // Health check (required by Render)
+    // Health check (required by Render) — always respond even before Telegram
     if (pathname === '/' || pathname === '/health') {
+      const botName = (bot && bot.botInfo) ? `@${bot.botInfo.username}` : 'connecting...';
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'ok',
         mode: 'cloud',
-        bot: bot.botInfo ? `@${bot.botInfo.username}` : 'connecting...',
+        bot: botName,
         uptime: process.uptime(),
         queuedMessages: messageQueue.length,
         queuedOutbox: outboxQueue.length,
@@ -469,7 +470,7 @@ bot.on('text', async (ctx) => {
 });
 
 // ================================================================
-// START
+// START — Lazy connection: HTTP server first, Telegram async later
 // ================================================================
 async function start() {
   console.log('');
@@ -483,75 +484,93 @@ async function start() {
 
   if (IS_CLOUD) {
     cloudInit();
+    // Start HTTP server FIRST so Render health check passes immediately
+    startCloudAPI(null, false);
   } else {
     // Ensure Obsidian directories
     vaultWrite(`${CONFIG.inboxDir}/.gitkeep`, '');
     vaultWrite(`${CONFIG.outboxDir}/.gitkeep`, '');
   }
 
-  // Start Telegram
+  // Connect to Telegram asynchronously with timeout
+  connectTelegramAsync(bot).then(connected => {
+    if (connected) {
+      log('✅ Telegram connected');
+      
+      // Outbox polling (every 2 seconds) — only after Telegram is ready
+      const outboxTimer = setInterval(() => processOutbox(bot), 2000);
+      pollingIntervals.push(outboxTimer);
+      
+      // Health ping (cloud mode only)
+      if (IS_CLOUD) {
+        const healthTimer = setInterval(() => {
+          log(`Heartbeat: ${messageQueue.length} in, ${outboxQueue.length} out`);
+        }, 300000);
+        pollingIntervals.push(healthTimer);
+      }
+      
+      log('✅ Relay active');
+    } else {
+      log('⚠️ Telegram not available — running in API-only mode');
+      log('   Bot will not send/receive messages until Telegram reconnects');
+      // Keep retrying every 30 seconds
+      const retryTimer = setInterval(async () => {
+        const ok = await connectTelegramAsync(bot);
+        if (ok) {
+          clearInterval(retryTimer);
+          log('✅ Telegram reconnected');
+          
+          // Start outbox processing
+          const outboxTimer = setInterval(() => processOutbox(bot), 2000);
+          pollingIntervals.push(outboxTimer);
+          
+          if (IS_CLOUD) {
+            const healthTimer = setInterval(() => {
+              log(`Heartbeat: ${messageQueue.length} in, ${outboxQueue.length} out`);
+            }, 300000);
+            pollingIntervals.push(healthTimer);
+          }
+          
+          log('✅ Relay active');
+        }
+      }, 30000);
+      pollingIntervals.push(retryTimer);
+    }
+  });
+
+  log('✅ HTTP server running — Render health check ready');
+}
+
+// Async Telegram connection (does NOT crash process on failure)
+async function connectTelegramAsync(bot) {
   try {
     const me = await bot.telegram.getMe();
     bot.botInfo = me;
-    let useWebhook = false;
-
+    
     if (IS_CLOUD && CONFIG.webhookDomain) {
-      // --- WEBHOOK MODE (cloud + custom domain) ---
-      useWebhook = true;
-      // Start webhook-capable server on the configured port
-      // Telegraf webhook requires the bot to be able to receive updates
-      // We'll integrate webhook with our existing HTTP server
+      // Try to set webhook (best effort — if it fails, polling still works)
+      try {
+        const webhookUrl = `https://${CONFIG.webhookDomain}/telegraf`;
+        await bot.telegram.setWebhook(webhookUrl);
+        log(`✅ Webhook set: ${webhookUrl}`);
+      } catch (e) {
+        log(`⚠️ Webhook failed: ${e.message} (falling back to polling)`);
+      }
       
-      // First, set the webhook on Telegram's side
-      const webhookUrl = `https://${CONFIG.webhookDomain}/telegraf`;
-      await bot.telegram.setWebhook(webhookUrl);
-      log(`✅ Webhook set: ${webhookUrl}`);
-      
-      // Start our custom HTTP server that handles both API and webhook
-      // For webhook, we need to handle POST /telegraf path
-      // We'll extend startCloudAPI to also handle webhook route
-      
-      // Actually, let's use a two-server approach:
-      // 1. Our custom API server (for sync)
-      // 2. Telegraf webhook server (for Telegram updates)
-      // But wait - Telegraf's webhook can be integrated into our server
-      
-      // Simple approach: Use our API server to handle both
-      // We'll create the API server that includes webhook handling
-      startCloudAPI(bot, true);
-      
-      // Also start polling for redundancy (webhook + polling backup)
       bot.startPolling();
-      log(`✅ Bot @${me.username} is live (webhook+API on :${CONFIG.serverPort})`);
+      log(`✅ Bot @${me.username} is live (polling on :${CONFIG.serverPort})`);
     } else if (IS_CLOUD) {
-      // --- CLOUD POLLING MODE (no domain) ---
       bot.startPolling();
-      startCloudAPI(bot, false);
-      log(`✅ Bot @${me.username} is live (polling + API on :${CONFIG.serverPort})`);
+      log(`✅ Bot @${me.username} is live (polling on :${CONFIG.serverPort})`);
     } else {
-      // --- LOCAL MODE: polling only ---
       bot.startPolling();
       log(`✅ Bot @${me.username} is live (local polling)`);
-      log(`   Screenshot: ${isScreenshotAvailable() ? '✅ available' : '❌ npm install screenshot-desktop'}`);
     }
+    return true;
   } catch (e) {
-    log(`❌ Telegram error: ${e.message}`);
-    process.exit(1);
+    log(`⚠️ Telegram connection failed: ${e.message}`);
+    return false;
   }
-
-  // Outbox polling (every 2 seconds)
-  const outboxTimer = setInterval(() => processOutbox(bot), 2000);
-  pollingIntervals.push(outboxTimer);
-
-  // Health ping (cloud mode only — keep Render alive)
-  if (IS_CLOUD) {
-    const healthTimer = setInterval(() => {
-      log(`Heartbeat: ${messageQueue.length} in, ${outboxQueue.length} out`);
-    }, 300000); // Every 5 minutes
-    pollingIntervals.push(healthTimer);
-  }
-
-  log('✅ Relay active');
 }
 
 // ================================================================
