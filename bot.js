@@ -24,6 +24,15 @@ const path = require('path');
 const http = require('http');
 
 // ================================================================
+// FEATURE MODULES
+// ================================================================
+const remote = require('./features/remote');
+const imagegen = require('./features/imagegen');
+const aichat = require('./features/aichat');
+const files = require('./features/files');
+// voice is loaded on-demand (needs ffmpeg/form-data)
+
+// ================================================================
 // Mode Detection
 // ================================================================
 const MODE = (process.env.CLIENT_MODE || 'local').toLowerCase();
@@ -427,8 +436,68 @@ function startCloudAPI(bot, useWebhook) {
         messagesQueued: outboxQueue.length,
         mode: 'cloud',
         webhook: useWebhook ? 'active' : 'polling',
-        screenshotAvailable: isScreenshotAvailable(),
+        screenshotAvailable: remote.isScreenshotAvailable,
       }));
+      return;
+    }
+
+    // ================================================================
+    // FEATURE API ENDPOINTS (Cloud mode)
+    // ================================================================
+    
+    // AI Chat
+    if (pathname === '/api/ai' && req.method === 'POST') {
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', async () => {
+        try {
+          const { prompt } = JSON.parse(body);
+          if (!prompt) { res.writeHead(400); res.end(JSON.stringify({ error: 'prompt required' })); return; }
+          const result = await aichat.aiChat(prompt);
+          res.writeHead(result.error ? 400 : 200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(result));
+        } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: e.message })); }
+      });
+      return;
+    }
+
+    // Image Generation
+    if (pathname === '/api/img' && req.method === 'POST') {
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', async () => {
+        try {
+          const { prompt, width, height } = JSON.parse(body);
+          if (!prompt) { res.writeHead(400); res.end(JSON.stringify({ error: 'prompt required' })); return; }
+          const result = await imagegen.generateImage(prompt, width || 1024, height || 1024);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: true,
+            source: result.source,
+            buffer: result.buffer.toString('base64'),
+          }));
+        } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: e.message })); }
+      });
+      return;
+    }
+
+    // PC Status (read-only, safe for cloud)
+    if (pathname === '/api/pcstatus') {
+      (async () => {
+        if (!IS_LOCAL) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ mode: 'cloud', message: 'PC not available in cloud mode' }));
+          return;
+        }
+        try {
+          const status = await remote.getPCStatus();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(status));
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      })();
       return;
     }
 
@@ -470,32 +539,241 @@ bot.on('text', async (ctx) => {
         return;
       case '/status':
         await ctx.reply(
-          `🤖 Bot status:\n` +
-          `• Mode: cloud\n` +
-          `• Pending messages: ${messageQueue.length}\n` +
+          `🤖 *Telegram Commander v4.1*\n\n` +
+          `• Mode: ${MODE}\n` +
+          `• Messages: ${messageQueue.length} in / ${outboxQueue.length} out\n` +
           `• Uptime: ${Math.floor(process.uptime() / 60)} min\n` +
-          `• Screenshot: ${isScreenshotAvailable() ? '✅' : '❌'}`
+          `• CWD: \`${files.getCwd()}\`\n` +
+          `• Remote: ${IS_LOCAL ? '✅' : '☁️ API-only'}\n` +
+          `• Screenshot: ${remote.isScreenshotAvailable ? '✅' : '❌'}\n` +
+          `• AI: ${process.env.OPENAI_API_KEY || process.env.AI_API_KEY ? '✅' : '❌ API key'}`,
+          { parse_mode: 'Markdown' }
         );
         return;
       case '/help':
         await ctx.reply(
-          `📋 Commands:\n/status — Bot status\n/help — This help\n/queue — Pending messages count\n/screenshot — 📸 Take screenshot (local mode only)`
+          `📋 *Telegram Commander v4.1*\n\n` +
+          `*PC Remote:*\n` +
+          `/cmd <command> — Run shell command\n` +
+          `/ps [name] — List processes\n` +
+          `/kill <name|pid> — Kill process\n` +
+          `/shutdown [s] — Shutdown PC\n` +
+          `/reboot [s] — Reboot PC\n` +
+          `/lock — Lock workstation\n` +
+          `/sleep — Sleep mode\n` +
+          `/pcstatus — CPU, RAM, uptime\n` +
+          `/clipboard — Read clipboard\n` +
+          `/screenshot — 📸 Take screenshot\n\n` +
+          `*Files:*\n` +
+          `/dir [path] — List directory\n` +
+          `/cd <path> — Change directory\n` +
+          `/cat <file> — Read file\n` +
+          `/download <file> — Download file\n\n` +
+          `*AI:*\n` +
+          `/ai <prompt> — Ask AI (OpenAI)\n` +
+          `/img <prompt> — Generate image\n` +
+          `/opencode <prompt> — OpenCode CLI\n` +
+          `/gemini <prompt> — Gemini CLI\n\n` +
+          `*System:*\n` +
+          `/status — Bot status\n` +
+          `/queue — Pending messages\n` +
+          `/help — This help`,
+          { parse_mode: 'Markdown' }
         );
         return;
       case '/queue':
         await ctx.reply(`📬 Pending: ${messageQueue.length} messages, ${outboxQueue.length} outgoing`);
         return;
       case '/screenshot':
-        if (IS_LOCAL || isScreenshotAvailable()) {
-          await handleScreenshot(bot);
+        if (IS_LOCAL) {
+          try {
+            const img = await remote.takeScreenshot();
+            await ctx.replyWithPhoto({ source: img }, { caption: `📸 ${new Date().toLocaleString()}` });
+          } catch (e) {
+            await ctx.reply(`❌ Screenshot failed: ${e.message}`);
+          }
         } else {
           await ctx.reply('❌ Screenshot only available in local mode');
         }
         return;
+      // ================================================================
+      // PC REMOTE CONTROL
+      // ================================================================
+      case '/cmd': {
+        const cmd = text.substring(5).trim();
+        if (!cmd) { await ctx.reply('Usage: /cmd <command>\nExample: /cmd dir'); return; }
+        if (!IS_LOCAL) { await ctx.reply('❌ PC control only in local mode'); return; }
+        const result = await remote.runCommand(cmd);
+        const output = result.length > 4000 ? result.substring(0, 3900) + '\n... (truncated)' : result;
+        await ctx.reply(`💻 \`${cmd}\`\n\`\`\`\n${output}\n\`\`\``, { parse_mode: 'Markdown' });
+        return;
+      }
+      case '/ps': {
+        if (!IS_LOCAL) { await ctx.reply('❌ PC control only in local mode'); return; }
+        const filter = text.substring(4).trim() || null;
+        const result = await remote.listProcesses(filter);
+        await ctx.reply(`📊 Processes:\n\`\`\`\n${result.substring(0, 3500)}\n\`\`\``, { parse_mode: 'Markdown' });
+        return;
+      }
+      case '/kill': {
+        if (!IS_LOCAL) { await ctx.reply('❌ PC control only in local mode'); return; }
+        const target = text.substring(6).trim();
+        if (!target) { await ctx.reply('Usage: /kill <process_name|PID>'); return; }
+        const result = await remote.killProcess(target);
+        await ctx.reply(`🔪 ${result.substring(0, 500)}`);
+        return;
+      }
+      case '/shutdown': {
+        if (!IS_LOCAL) { await ctx.reply('❌ PC control only in local mode'); return; }
+        const delay = parseInt(text.substring(10).trim()) || 30;
+        const result = await remote.shutdownPC(delay);
+        await ctx.reply(`🔌 Shutdown in ${delay}s\n${result}`);
+        return;
+      }
+      case '/reboot': {
+        if (!IS_LOCAL) { await ctx.reply('❌ PC control only in local mode'); return; }
+        const delay = parseInt(text.substring(8).trim()) || 30;
+        const result = await remote.rebootPC(delay);
+        await ctx.reply(`🔄 Reboot in ${delay}s\n${result}`);
+        return;
+      }
+      case '/lock': {
+        if (!IS_LOCAL) { await ctx.reply('❌ PC control only in local mode'); return; }
+        await remote.lockWorkstation();
+        await ctx.reply('🔒 PC locked');
+        return;
+      }
+      case '/sleep': {
+        if (!IS_LOCAL) { await ctx.reply('❌ PC control only in local mode'); return; }
+        await remote.sleepMode();
+        await ctx.reply('💤 Good night!');
+        return;
+      }
+      case '/pcstatus': {
+        if (!IS_LOCAL) { await ctx.reply('❌ PC control only in local mode'); return; }
+        const status = await remote.getPCStatus();
+        await ctx.reply(
+          `🖥️ *PC Status*\n\n` +
+          `• Host: \`${status.hostname}\`\n` +
+          `• OS: ${status.platform}\n` +
+          `• Uptime: ${status.uptime}\n` +
+          `• CPU: ${status.cpuLoad} (${status.cpu})\n` +
+          `• RAM: ${status.memory}\n` +
+          `• Screenshot: ${status.screenshot ? '✅' : '❌'}`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+      case '/clipboard': {
+        if (!IS_LOCAL) { await ctx.reply('❌ PC control only in local mode'); return; }
+        const result = await remote.readClipboard();
+        const output = result.length > 1000 ? result.substring(0, 1000) + '\n... (truncated)' : result;
+        await ctx.reply(`📋 Clipboard:\n\`\`\`\n${output}\n\`\`\``, { parse_mode: 'Markdown' });
+        return;
+      }
+      // ================================================================
+      // FILE OPERATIONS
+      // ================================================================
+      case '/dir': {
+        if (!IS_LOCAL) { await ctx.reply('❌ File ops only in local mode'); return; }
+        const dirArg = text.substring(5).trim() || '.';
+        try {
+          const listing = files.listDirectory(dirArg);
+          await ctx.reply(listing.substring(0, 4000), { parse_mode: 'Markdown' });
+        } catch (e) { await ctx.reply(`❌ ${e.message}`); }
+        return;
+      }
+      case '/cd': {
+        if (!IS_LOCAL) { await ctx.reply('❌ File ops only in local mode'); return; }
+        const target = text.substring(4).trim();
+        if (!target) { await ctx.reply(`📂 ${files.getCwd()}`); return; }
+        if (files.setCwd(target)) {
+          await ctx.reply(`📂 ${files.getCwd()}`);
+        } else {
+          await ctx.reply(`❌ Directory not found: ${target}`);
+        }
+        return;
+      }
+      case '/cat': {
+        if (!IS_LOCAL) { await ctx.reply('❌ File ops only in local mode'); return; }
+        const filePath = text.substring(5).trim();
+        if (!filePath) { await ctx.reply('Usage: /cat <filepath>'); return; }
+        try {
+          const content = files.readFileContent(filePath);
+          await ctx.reply(content.substring(0, 4000), { parse_mode: 'Markdown' });
+        } catch (e) { await ctx.reply(`❌ ${e.message}`); }
+        return;
+      }
+      case '/download': {
+        if (!IS_LOCAL) { await ctx.reply('❌ File ops only in local mode'); return; }
+        const filePath = text.substring(10).trim();
+        if (!filePath) { await ctx.reply('Usage: /download <filepath>'); return; }
+        try {
+          const absPath = files.getFilePath(filePath);
+          if (!require('fs').existsSync(absPath)) { await ctx.reply('❌ File not found'); return; }
+          await ctx.replyWithDocument({ source: absPath, filename: path.basename(absPath) });
+        } catch (e) { await ctx.reply(`❌ ${e.message}`); }
+        return;
+      }
+      // ================================================================
+      // AI & IMAGE GENERATION
+      // ================================================================
+      case '/ai':
+      case '/ask': {
+        const prompt = text.substring(text.startsWith('/ai') ? 4 : 5).trim();
+        if (!prompt) { await ctx.reply('Usage: /ai <question>'); return; }
+        await ctx.reply('🤔 Thinking...');
+        const result = await aichat.aiChat(prompt);
+        if (result.error) { await ctx.reply(`❌ ${result.error}`); return; }
+        const reply = result.text.length > 4000 ? result.text.substring(0, 3900) + '\n...' : result.text;
+        await ctx.reply(reply, { parse_mode: 'Markdown' });
+        return;
+      }
+      case '/img':
+      case '/imagine': {
+        const prompt = text.substring(text.startsWith('/img') ? 5 : 9).trim();
+        if (!prompt) { await ctx.reply('Usage: /img <prompt> [width] [height]\nExample: /img futuristic city 1024 768'); return; }
+        const parts = prompt.split(' ');
+        let w = 1024, h = 1024, model = 'flux';
+        const imgPrompt = [];
+        for (const p of parts) {
+          if (/^\d+$/.test(p) && !w) { w = parseInt(p); }
+          else if (/^\d+$/.test(p) && w) { h = parseInt(p); }
+          else { imgPrompt.push(p); }
+        }
+        await ctx.reply('🎨 Generating image...');
+        try {
+          const { buffer, source } = await imagegen.generateImage(imgPrompt.join(' '), w, h, model);
+          await ctx.replyWithPhoto({ source: buffer }, { caption: `🎨 ${imgPrompt.join(' ')}\n🖼️ ${w}x${h} | Source: ${source}` });
+        } catch (e) {
+          await ctx.reply(`❌ ${e.message}`);
+        }
+        return;
+      }
+      case '/opencode': {
+        if (!IS_LOCAL) { await ctx.reply('❌ CLI mode only in local mode'); return; }
+        const prompt = text.substring(10).trim();
+        if (!prompt) { await ctx.reply('Usage: /opencode <prompt>'); return; }
+        await ctx.reply('🤖 Running OpenCode...');
+        const result = await aichat.runCLI('opencode', prompt, { timeout: 120000 });
+        if (result.error) { await ctx.reply(`❌ ${result.error}`); return; }
+        await ctx.reply(`\`\`\`\n${result.text.substring(0, 3900)}\n\`\`\``, { parse_mode: 'Markdown' });
+        return;
+      }
+      case '/gemini': {
+        if (!IS_LOCAL) { await ctx.reply('❌ CLI mode only in local mode'); return; }
+        const prompt = text.substring(8).trim();
+        if (!prompt) { await ctx.reply('Usage: /gemini <prompt>'); return; }
+        await ctx.reply('🤖 Running Gemini CLI...');
+        const result = await aichat.runCLI('gemini', prompt, { timeout: 120000 });
+        if (result.error) { await ctx.reply(`❌ ${result.error}`); return; }
+        await ctx.reply(`\`\`\`\n${result.text.substring(0, 3900)}\n\`\`\``, { parse_mode: 'Markdown' });
+        return;
+      }
     }
   }
 
-  // Save message
+  // Save non-command messages
   saveIncomingMessage(text, msgId, ts);
 });
 
