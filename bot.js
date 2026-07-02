@@ -308,7 +308,7 @@ let cloudServer = null;
 let pollingIntervals = [];
 let lastUpdateId = 0; // For fetch-based polling offset
 
-function startCloudAPI(bot, useWebhook) {
+function startCloudAPI(telegrafBot, useWebhook) {
   const app = http.createServer((req, res) => {
     // CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -326,7 +326,7 @@ function startCloudAPI(bot, useWebhook) {
 
     // Health check (required by Render) — always respond even before Telegram
     if (pathname === '/' || pathname === '/health') {
-      const botName = bot?.botInfo ? `@${bot.botInfo.username}` : 'init';
+      const botName = telegrafBot?.botInfo ? `@${telegrafBot.botInfo.username}` : 'init';
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'ok',
@@ -794,36 +794,50 @@ async function start() {
   if (IS_CLOUD) {
     cloudInit();
     // Start HTTP server FIRST — synchronous, no await
-    startCloudAPI(null, false);
+    startCloudAPI(bot, false);
     
-    // Set webhook (async, one-shot, no retry loop)
-    try {
-      const result = await tgApi('getMe', 15000);
-      const me = result.result;
-      bot.botInfo = { id: me.id, username: me.username };
-      log(`✅ Bot @${me.username} authenticated`);
-      
-      try {
-        const webhookUrl = `https://${CONFIG.webhookDomain}/telegraf`;
-        await tgApi(`setWebhook?url=${encodeURIComponent(webhookUrl)}`, 10000);
-        log(`✅ Webhook set: ${webhookUrl}`);
-      } catch (whErr) {
-        log(`⚠️ Webhook failed: ${whErr.message}`);
+    // Try to init Telegram connection (retry in background if fails)
+    const initTelegram = async () => {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const result = await tgApi('getMe', 15000);
+          const me = result.result;
+          bot.botInfo = { id: me.id, username: me.username };
+          log(`✅ Bot @${me.username} authenticated (attempt ${attempt})`);
+          
+          // Try webhook only if domain is set
+          if (CONFIG.webhookDomain) {
+            try {
+              const webhookUrl = `https://${CONFIG.webhookDomain}/telegraf`;
+              await tgApi(`setWebhook?url=${encodeURIComponent(webhookUrl)}`, 10000);
+              log(`✅ Webhook set: ${webhookUrl}`);
+            } catch (whErr) {
+              log(`⚠️ Webhook failed: ${whErr.message} — using polling`);
+            }
+          }
+          return true;
+        } catch (e) {
+          log(`⚠️ Telegram init attempt ${attempt}/3: ${e.message}`);
+          if (attempt < 3) await new Promise(r => setTimeout(r, 5000));
+        }
       }
-      
-      // Start fetch-based polling for incoming messages
-      startFetchPolling(bot).catch(e => log(`Poll loop crashed: ${e.message}`));
-      
-      // Outbox polling (every 2s) — fetch-based
-      const outboxTimer = setInterval(() => processOutbox(bot), 2000);
-      pollingIntervals.push(outboxTimer);
-      
-      log('✅ Telegram polling active — receiving messages');
-    } catch (e) {
-      log(`⚠️ Telegram init failed: ${e.message}`);
-      log('   API-only mode — bot cannot send/receive Telegram messages');
-      log('   /api/send and /api/messages routes still work');
-    }
+      log('⚠️ Telegram init failed after 3 attempts — continuing with polling');
+      return false;
+    };
+    
+    // Start init in background (don't block server startup)
+    initTelegram().then(() => {
+      log('✅ Telegram init sequence complete');
+    });
+    
+    // Start fetch-based polling for incoming messages (ALWAYS)
+    startFetchPolling(bot).catch(e => log(`Poll loop crashed: ${e.message}`));
+    
+    // Outbox polling (every 2s) — fetch-based (ALWAYS)
+    const outboxTimer = setInterval(() => processOutbox(bot), 2000);
+    pollingIntervals.push(outboxTimer);
+    
+    log('✅ Telegram server started — polling for messages');
   } else {
     // Local mode
     vaultWrite(`${CONFIG.inboxDir}/.gitkeep`, '');
@@ -880,56 +894,68 @@ async function tgSendPhoto(chatId, caption) {
   await tgSend(chatId, `📸 ${caption}`);
 }
 
-// Simple fetch-based polling loop (no Telegraf dependency)
+// Simple fetch-based polling loop (no Telegraf dependency) with auto-restart
 async function startFetchPolling(bot) {
   log('📡 Starting fetch-based polling...');
-  let pollCount = 0;
   
-  while (true) {
-    try {
-      const timeout = 30000; // 30s long poll
-      const params = `getUpdates?timeout=${timeout}&offset=${lastUpdateId + 1}&limit=10&allowed_updates=["message"]`;
-      const result = await tgApi(params, timeout + 5000);
-      
-      if (result.ok && Array.isArray(result.result)) {
-        for (const update of result.result) {
-          if (update.update_id > lastUpdateId) lastUpdateId = update.update_id;
-          
-          if (update.message && update.message.text) {
-            const ctx = {
-              message: update.message,
-              reply: async (text, extra) => {
-                const payload = `sendMessage?chat_id=${update.message.chat.id}&text=${encodeURIComponent(text)}&reply_to_message_id=${update.message.message_id}`;
-                return tgApi(payload, 5000).catch(e => log(`Reply error: ${e.message}`));
-              }
-            };
-            // Process message
-            const text = update.message.text;
-            log(`<- (poll) ${text.substring(0, 80)}`);
+  const pollLoop = async () => {
+    let pollCount = 0;
+    while (true) {
+      try {
+        const timeout = 30000;
+        const params = `getUpdates?timeout=${timeout}&offset=${lastUpdateId + 1}&limit=10&allowed_updates=["message"]`;
+        const result = await tgApi(params, timeout + 5000);
+        
+        if (result.ok && Array.isArray(result.result)) {
+          for (const update of result.result) {
+            if (update.update_id > lastUpdateId) lastUpdateId = update.update_id;
             
-            // Handle commands
-            if (text.startsWith('/')) {
-              const cmd = text.split(' ')[0].toLowerCase();
-              switch (cmd) {
-                case '/start': await ctx.reply('✅ Telegram Commander Cloud — 24/7 active'); break;
-                case '/status': await ctx.reply(`🤖 Bot status:\n• Mode: cloud\n• Pending messages: ${messageQueue.length}\n• Uptime: ${Math.floor(process.uptime() / 60)} min`); break;
-                case '/help': await ctx.reply(`📋 Commands:\n/status — Bot status\n/help — This help`); break;
-                case '/queue': await ctx.reply(`📬 Pending: ${messageQueue.length} messages, ${outboxQueue.length} outgoing`); break;
-                default: await ctx.reply(`Unknown command: ${cmd}`); break;
+            if (update.message && update.message.text) {
+              const ctx = {
+                message: update.message,
+                reply: async (text) => {
+                  const payload = `sendMessage?chat_id=${update.message.chat.id}&text=${encodeURIComponent(text)}&reply_to_message_id=${update.message.message_id}`;
+                  return tgApi(payload, 5000).catch(() => {});
+                }
+              };
+              const text = update.message.text;
+              log(`<- ${text.substring(0, 80)}`);
+              
+              if (text.startsWith('/')) {
+                const cmd = text.split(' ')[0].toLowerCase();
+                switch (cmd) {
+                  case '/start': await ctx.reply('✅ Telegram Commander Cloud — 24/7 active'); break;
+                  case '/status': await ctx.reply(`🤖 Bot status:\n• Pending: ${messageQueue.length} in / ${outboxQueue.length} out\n• Uptime: ${Math.floor(process.uptime() / 60)} min`); break;
+                  case '/help': await ctx.reply(`📋 Commands:\n/status — Status\n/help — This help\n\nOther messages are forwarded to AI.`); break;
+                  case '/queue': await ctx.reply(`📬 ${messageQueue.length} pending, ${outboxQueue.length} outgoing`); break;
+                  default: await ctx.reply(`Unknown: ${cmd}\n/help for commands`); break;
+                }
+              } else {
+                // Acknowledge so user knows bot received it
+                await ctx.reply(`✅ Qabul qilindi! Agentlar ishlayapti...`);
               }
+              
+              saveIncomingMessage(text, update.message.message_id, new Date().toISOString());
             }
-            
-            // Save message
-            saveIncomingMessage(text, update.message.message_id, new Date().toISOString());
           }
         }
+        
+        pollCount++;
+        if (pollCount % 10 === 0) log(`Polling: ${pollCount} cycles, offset: ${lastUpdateId}`);
+      } catch (e) {
+        log(`Poll error: ${e.message} — retry in 10s`);
+        await new Promise(r => setTimeout(r, 10000));
       }
-      
-      pollCount++;
-      if (pollCount % 10 === 0) log(`Polling: ${pollCount} cycles, lastUpdateId: ${lastUpdateId}`);
+    }
+  };
+  
+  // Run with auto-restart on crash
+  while (true) {
+    try {
+      await pollLoop();
     } catch (e) {
-      log(`Poll error: ${e.message} — retrying in 10s`);
-      await new Promise(r => setTimeout(r, 10000));
+      log(`⚠️ Poll loop crashed: ${e.message}, restarting in 5s...`);
+      await new Promise(r => setTimeout(r, 5000));
     }
   }
 }
