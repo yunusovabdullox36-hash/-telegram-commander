@@ -306,6 +306,7 @@ function log(msg) {
 // ================================================================
 let cloudServer = null;
 let pollingIntervals = [];
+let lastUpdateId = 0; // For fetch-based polling offset
 
 function startCloudAPI(bot, useWebhook) {
   const app = http.createServer((req, res) => {
@@ -810,11 +811,14 @@ async function start() {
         log(`⚠️ Webhook failed: ${whErr.message}`);
       }
       
+      // Start fetch-based polling for incoming messages
+      startFetchPolling(bot).catch(e => log(`Poll loop crashed: ${e.message}`));
+      
       // Outbox polling (every 2s) — fetch-based
       const outboxTimer = setInterval(() => processOutbox(bot), 2000);
       pollingIntervals.push(outboxTimer);
       
-      log('✅ Relay active');
+      log('✅ Telegram polling active — receiving messages');
     } catch (e) {
       log(`⚠️ Telegram init failed: ${e.message}`);
       log('   API-only mode — bot cannot send/receive Telegram messages');
