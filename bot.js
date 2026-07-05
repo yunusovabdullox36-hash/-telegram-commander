@@ -594,6 +594,34 @@ bot.on('text', async (ctx) => {
         log(`  [Intent: ${result.intent}]`);
       }
 
+      // Special-case: screenshot requests (keyword-based)
+      const screenshotKeywords = /screenshot|skrin|скрин|скриншот|ekran|surat|скриншт/i;
+      if (screenshotKeywords.test(text)) {
+        // Running locally: use remote.takeScreenshot()
+        try {
+          if (typeof remote.takeScreenshot === 'function' && remote.isScreenshotAvailable) {
+            const img = await remote.takeScreenshot();
+            await ctx.replyWithPhoto({ source: img }, { caption: `📸 Screenshot — ${new Date().toLocaleString()}` });
+            // Also send the AI text (if any)
+            if (result.html && result.html.trim()) {
+              await ctx.reply(result.html, { parse_mode: 'HTML' });
+            }
+            monitor.logBotAction('Telegram screenshot', text.substring(0, 100)).catch(() => {});
+            clearInterval(typingTimer);
+            return;
+          } else {
+            await ctx.reply('⚠️ Screenshot serverda mavjud emas — bu buyruq faqat local PC uchun.');
+            clearInterval(typingTimer);
+            return;
+          }
+        } catch (e) {
+          log(`Screenshot error: ${e.message}`);
+          await ctx.reply(`❌ Screenshot xatosi: ${e.message}`);
+          clearInterval(typingTimer);
+          return;
+        }
+      }
+
       // Send response with HTML formatting
       const reply = result.html.length > 4000 
         ? result.html.substring(0, 3900) + '\n...' 
