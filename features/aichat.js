@@ -157,4 +157,113 @@ function jsonFetch(url, options = {}, timeout = 30000) {
   });
 }
 
-module.exports = { aiChat, runCLI };
+// ================================================================
+// OpenAI Function Calling — AI Chat with Tools
+// ================================================================
+// Allows AI to call functions/tools like runCommand, openBrowser, etc.
+// ================================================================
+
+async function aiChatWithTools(userMessage, tools, systemPrompt, messageHistory = []) {
+  const apiKey = process.env.OPENAI_API_KEY || process.env.AI_API_KEY;
+  const model = process.env.AI_MODEL || 'gpt-4o-mini';
+  const baseUrl = process.env.AI_BASE_URL || 'https://api.openai.com/v1';
+
+  if (!apiKey) {
+    return { error: 'AI_API_KEY not configured' };
+  }
+
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...messageHistory,
+    { role: 'user', content: userMessage }
+  ];
+
+  const body = JSON.stringify({
+    model,
+    messages,
+    tools,
+    tool_choice: 'auto',
+    max_tokens: 2000,
+    temperature: 0.7,
+  });
+
+  try {
+    const data = await jsonFetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body,
+    }, 30000);
+
+    if (data.error) {
+      return { error: `AI API error: ${data.error.message || JSON.stringify(data.error)}` };
+    }
+
+    const choice = data.choices?.[0];
+    if (!choice) return { error: 'No response from AI' };
+
+    const message = choice.message;
+    const text = message.content?.trim() || '';
+    const toolCalls = message.tool_calls?.map(tc => ({
+      id: tc.id,
+      name: tc.function.name,
+      args: JSON.parse(tc.function.arguments || '{}'),
+    })) || [];
+
+    return { text, toolCalls, model: data.model, usage: data.usage };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+// ================================================================
+// Continue conversation after tool results
+// ================================================================
+
+async function continueWithTools(messages, tools, maxTokens = 1000) {
+  const apiKey = process.env.OPENAI_API_KEY || process.env.AI_API_KEY;
+  const model = process.env.AI_MODEL || 'gpt-4o-mini';
+  const baseUrl = process.env.AI_BASE_URL || 'https://api.openai.com/v1';
+
+  if (!apiKey) return { error: 'AI_API_KEY not configured' };
+
+  const body = JSON.stringify({
+    model,
+    messages,
+    tools,
+    tool_choice: 'auto',
+    max_tokens: maxTokens,
+    temperature: 0.7,
+  });
+
+  try {
+    const data = await jsonFetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body,
+    }, 30000);
+
+    if (data.error) return { error: `AI API error: ${JSON.stringify(data.error)}` };
+
+    const choice = data.choices?.[0];
+    if (!choice) return { error: 'No response' };
+
+    const text = choice.message?.content?.trim() || '';
+    const toolCalls = choice.message?.tool_calls?.map(tc => ({
+      id: tc.id,
+      name: tc.function.name,
+      args: JSON.parse(tc.function.arguments || '{}'),
+    })) || [];
+
+    return { text, toolCalls };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+module.exports = { aiChat, runCLI, aiChatWithTools, continueWithTools };
